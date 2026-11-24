@@ -1,0 +1,11 @@
+# Live data: accounts, sign-in sessions, the HTTPS private key, uploads. Never commit it.
+tvboard-data/
+
+# Installed packages (npm install puts them back)
+node_modules/
+
+# Local copies of older versions
+server.backup-*.js
+
+# Editor and tool settings
+.claude/
