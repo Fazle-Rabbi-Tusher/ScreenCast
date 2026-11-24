@@ -90,6 +90,7 @@ const BIND = String(process.env.BIND || '').trim();
 const SESSION_MS = 12 * 3600 * 1000;
 const IDLE_MS = envNumber('IDLE_MINUTES', 60) * 60 * 1000;        // 0 = never
 const MAX_SIGNING_IN = 8;          // passwords being checked at the same time, over all addresses
+const ROOM_STEP = 8 * 1024 * 1024; // while an upload arrives, disk room is checked again after every this many bytes
 const PAIR_MS = 15 * 60 * 1000;    // how long the code on an unpaired TV stays good
 const ADOPT_MS = 2 * 60 * 1000;    // after pairing is switched on, connected TVs have this long to collect their key
 const MAX_FAILS = 5;               // wrong passwords from one address...
@@ -282,7 +283,7 @@ function parseAllow(raw, label) {
   return raw.split(',').map(function (s) { return s.trim(); }).filter(Boolean).map(function (entry) {
     const parts = entry.split('/');
     const base = ipToInt(parts[0]);
-    const bits = parts.length > 1 ? Number(parts[1]) : 32;
+    const bits = parts.length > 1 ? (/^\d{1,2}$/.test(parts[1]) ? Number(parts[1]) : NaN) : 32;
     if (base === null || parts.length > 2 || !Number.isInteger(bits) || bits < 0 || bits > 32) {
       console.error(label + ': cannot understand "' + entry + '". Use addresses like 10.1.2.3 or 10.1.2.0/24.');
       process.exit(1);
@@ -421,6 +422,7 @@ function sha(text) { return crypto.createHash('sha256').update(text).digest('hex
 // Changes whenever the account's password changes, by any route. A session only counts
 // while it matches, so a new password always ends the sessions made with the old one.
 function pwTag(u) { return sha(String(u.salt)).slice(0, 16); }
+function accessTag(u) { return [u.role, JSON.stringify(u.screens || null), u.disabled ? 1 : 0, pwTag(u)].join('|'); }
 
 function loadSessions() {
   const map = new Map();
@@ -451,7 +453,35 @@ function saveSessions() {
 
 const sessions = loadSessions(); // sha256(token) -> { username, expires, pw, active, idle }
 const fails = new Map();         // address -> { count, first, until, logged }
-const signingIn = new Set();     // addresses whose password is being checked right now
+const signingIn = new Set();     // addresses (IPv6: their /64) whose password is being checked right now
+let checking = 0;                // passwords being checked right now, over all addresses
+
+// The lockout and the one-check-at-a-time rule count an IPv6 client by its /64 network,
+// because one device can give itself any number of addresses inside it.
+function failKey(ip) {
+  if (ip.indexOf(':') < 0) return ip;
+  const halves = ip.split('%')[0].split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length > 1 && halves[1] ? halves[1].split(':') : [];
+  const groups = halves.length > 1 ? head.concat(new Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), tail) : head;
+  return groups.slice(0, 4).map(function (g) { return (parseInt(g, 16) || 0).toString(16); }).join(':') + '::/64';
+}
+
+// One password check. Its slot is held only while scrypt runs, not through the delay after
+// a wrong guess, so a few clients sending wrong passwords cannot keep everyone else out.
+async function checkGuarded(key, password, rec) {
+  if (signingIn.has(key) || checking >= MAX_SIGNING_IN) {
+    throw httpError(429, 'Another sign-in is being checked. Try again in a moment.');
+  }
+  signingIn.add(key);
+  checking++;
+  try {
+    return typeof password === 'string' && password.length <= 200 && await checkPassword(password, rec);
+  } finally {
+    checking--;
+    signingIn.delete(key);
+  }
+}
 
 function cookieValue(req, name) {
   const parts = String(req.headers.cookie || '').split(';');
@@ -508,13 +538,21 @@ function lockedFor(ip) {
   return f && f.until > Date.now() ? f.until - Date.now() : 0;
 }
 
-function noteFail(ip) {
+function noteFail(ip, name) {
   const now = Date.now();
   let f = fails.get(ip);
-  if (!f || now - f.first > LOCK_MS) f = { count: 0, first: now, until: 0 };
+  if (!f || now - f.first > LOCK_MS) f = { count: 0, first: now, until: 0, names: [] };
   f.count++;
-  if (f.count >= MAX_FAILS) { f.until = now + LOCK_MS; f.count = 0; f.first = now; f.logged = false; }
+  if (f.names.indexOf(name) < 0 && f.names.length < 50) f.names.push(name);
+  if (f.count >= MAX_FAILS) { f.until = now + LOCK_MS; f.count = 0; f.first = now; f.logged = false; f.names = []; }
   fails.set(ip, f);
+}
+
+// A correct password clears earlier wrong guesses only when they were all for that same
+// account. Signing in to one's own account must not wipe guesses at someone else's.
+function clearFails(ip, name) {
+  const f = fails.get(ip);
+  if (f && !(f.until > Date.now()) && f.names.every(function (n) { return n === name; })) fails.delete(ip);
 }
 
 setInterval(function () {
@@ -658,6 +696,8 @@ function sendMedia(req, res, name) {
 }
 
 const converting = new Set(); // document names being converted right now
+const reserved = new Set();   // names (and 'doc:'+stem) of uploads still arriving or converting
+let inflight = 0;             // bytes of uploads already on disk but not yet in the library
 
 function uploadTarget(raw) {
   const base = path.basename(String(raw || '').replace(/\\/g, '/'));
@@ -673,15 +713,25 @@ function uploadTarget(raw) {
     throw httpError(400, 'PowerPoint and Excel files need LibreOffice installed on the server. PDF works without it.');
   }
   let stem = base.slice(0, base.length - ext.length).replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+/, '').slice(0, 80);
+  if (!isDoc) stem = stem.replace(/\.page-/gi, '-page-'); // names like x.page-002 belong to documents
   if (!stem) stem = 'file';
+  // A name counts as taken while another upload of it is still arriving, and a document's
+  // name is taken while any of its pages exists, not just page 1.
+  let pageStems = null;
   const taken = function (st) {
-    return isDoc
-      ? converting.has(st) || fs.existsSync(path.join(MEDIA_DIR, st + '.page-001.jpg'))
-      : fs.existsSync(path.join(MEDIA_DIR, st + ext));
+    if (!isDoc) return reserved.has(st + ext) || fs.existsSync(path.join(MEDIA_DIR, st + ext));
+    if (converting.has(st) || reserved.has('doc:' + st)) return true;
+    if (!pageStems) {
+      pageStems = new Set();
+      fs.readdirSync(MEDIA_DIR).forEach(function (n) { const m = PAGE_RE.exec(n); if (m) pageStems.add(m[1]); });
+    }
+    return pageStems.has(st);
   };
   let unique = stem;
   for (let i = 2; taken(unique); i++) unique = stem + '-' + i;
-  return { stem: unique, ext: ext, isDoc: isDoc, name: unique + ext };
+  const hold = isDoc ? 'doc:' + unique : unique + ext;
+  reserved.add(hold);
+  return { stem: unique, ext: ext, isDoc: isDoc, name: unique + ext, hold: hold };
 }
 
 function run(cmd, args, timeoutMs) {
@@ -739,9 +789,15 @@ async function convertDocument(file, ext, stem) {
       }[e.code];
       throw httpError(400, why || (e.killed ? 'Converting that file took too long.' : 'That document could not be converted.'));
     }
+    let bytes = 0;
+    for (let n = 1; n <= pages; n++) bytes += fs.statSync(path.join(work, 'page-' + ('00' + n).slice(-3) + '.jpg')).size;
+    checkRoom(bytes); // the pictures count against the disk limits too
     for (let n = 1; n <= pages; n++) {
       const num = ('00' + n).slice(-3);
-      fs.copyFileSync(path.join(work, 'page-' + num + '.jpg'), path.join(MEDIA_DIR, stem + '.page-' + num + '.jpg'));
+      const page = stem + '.page-' + num + '.jpg';
+      // never over an existing file; a page belongs to its document, never to one uploader
+      fs.copyFileSync(path.join(work, 'page-' + num + '.jpg'), path.join(MEDIA_DIR, page), fs.constants.COPYFILE_EXCL);
+      if (state.owners) delete state.owners[page];
     }
     return pages;
   } finally {
@@ -794,7 +850,7 @@ function looksLike(file, ext) {
 function checkRoom(bytes) {
   if (MAX_LIBRARY) {
     const used = listMedia().reduce(function (n, m) { return n + m.size; }, 0);
-    if (used + bytes > MAX_LIBRARY) {
+    if (used + inflight + bytes > MAX_LIBRARY) {
       throw httpError(507, 'The media library is full (its limit is ' + Math.round(MAX_LIBRARY / 1048576) + ' MB). Delete some files first.');
     }
   }
@@ -807,18 +863,31 @@ function checkRoom(bytes) {
   }
 }
 
-function upload(req, res, url) {
+function upload(req, res, url, still) {
   const target = uploadTarget(url.searchParams.get('name'));
   const name = target.name;
-  if (Number(req.headers['content-length']) > MAX_UPLOAD) throw httpError(413, 'File is too large');
-  checkRoom(Number(req.headers['content-length']) || 0);
+  try {
+    if (Number(req.headers['content-length']) > MAX_UPLOAD) throw httpError(413, 'File is too large');
+    checkRoom(Number(req.headers['content-length']) || 0);
+  } catch (e) {
+    reserved.delete(target.hold);
+    throw e;
+  }
   const tmp = path.join(MEDIA_DIR, '.upload-' + crypto.randomBytes(6).toString('hex'));
   const out = fs.createWriteStream(tmp);
   let size = 0;
+  let counted = 0; // this upload's share of inflight
+  let nextCheck = ROOM_STEP;
   let failed = false;
+  function release() {
+    inflight -= counted;
+    counted = 0;
+    reserved.delete(target.hold);
+  }
   function fail(code, message) {
     if (failed) return;
     failed = true;
+    release();
     req.unpipe(out);
     out.destroy();
     fs.unlink(tmp, function () {});
@@ -826,8 +895,17 @@ function upload(req, res, url) {
     req.resume();
   }
   req.on('data', function (c) {
+    if (failed) return;
     size += c.length;
-    if (size > MAX_UPLOAD) fail(413, 'File is too large');
+    counted += c.length;
+    inflight += c.length;
+    if (size > MAX_UPLOAD) return fail(413, 'File is too large');
+    // The size announced at the start may be missing or wrong, so the room is checked
+    // again against what has really arrived, together with the other uploads under way.
+    if (size >= nextCheck) {
+      nextCheck = size + ROOM_STEP;
+      try { checkRoom(0); } catch (e) { fail(e.statusCode || 507, e.message); }
+    }
   });
   req.on('aborted', function () { fail(400, 'Upload interrupted'); });
   req.on('error', function () { fail(400, 'Upload failed'); });
@@ -839,6 +917,8 @@ function upload(req, res, url) {
   });
   function finish() {
     if (failed) return;
+    if (!still()) { fail(401, 'Your access changed while this was being sent. Sign in again.'); return; }
+    try { checkRoom(0); } catch (e) { fail(e.statusCode || 507, e.message); return; }
     if (size === 0) { fail(400, 'Empty file'); return; }
     if (!looksLike(tmp, target.ext)) {
       fail(400, 'The file contents do not match its type');
@@ -859,11 +939,15 @@ function upload(req, res, url) {
         if (!res.headersSent) sendJson(res, err.statusCode || 500, { error: err.statusCode ? err.message : 'That document could not be converted.' });
       }).then(function () {
         converting.delete(target.stem);
+        release();
         fs.unlink(tmp, function () {});
       });
       return;
     }
-    fs.renameSync(tmp, path.join(MEDIA_DIR, name));
+    const dest = path.join(MEDIA_DIR, name);
+    if (fs.existsSync(dest)) { fail(409, 'A file with that name appeared during the upload. Upload it again.'); return; }
+    fs.renameSync(tmp, dest);
+    release();
     setOwner(name, req.user);
     audit(req, 'media.upload', { name: name, bytes: size });
     sendJson(res, 200, { name: name });
@@ -942,6 +1026,8 @@ async function handle(req, res) {
         const adopted = !!s && !!adopt && adopt.until > now && (adopt.ips[s.id] || []).indexOf(ip) >= 0;
         if (!adopted) return sendJson(res, 401, { error: 'This TV is not paired', pair: true });
         give = keyOf(s);
+        delete adopt.ips[s.id]; // handed over once, and logged
+        audit(req, 'screen.adopt', { id: s.id, tv: ip });
       }
     } else if (!s) {
       return sendJson(res, 404, { error: 'Unknown screen' });
@@ -1002,51 +1088,42 @@ async function handle(req, res) {
   if (method === 'POST' && pathname === '/api/login') {
     if (req.headers['x-tvboard'] !== '1') throw httpError(403, 'Missing X-TVBoard header');
     if (!users.length) throw httpError(503, 'No admin account exists yet. On the server, run: node server.js set-password');
+    const fkey = failKey(ip);
     const locked = function () {
-      const wait = lockedFor(ip);
+      const wait = lockedFor(fkey);
       if (!wait) return;
-      const f = fails.get(ip);
+      const f = fails.get(fkey);
       if (!f.logged) { f.logged = true; audit(req, 'login.locked'); } // once per lockout: hammering cannot fill the log
       throw httpError(429, 'Too many wrong attempts. Try again in ' + Math.ceil(wait / 60000) + ' minutes.');
     };
     locked();
     const body = await readJson(req);
-    // One password check at a time per address, and only a few at once over all addresses.
-    // Guesses sent side by side would otherwise all be checked before the first failure
-    // was counted, slipping past the lockout and keeping the processor busy.
-    if (signingIn.has(ip) || signingIn.size >= MAX_SIGNING_IN) {
-      throw httpError(429, 'Another sign-in is being checked. Try again in a moment.');
+    locked();
+    const name = String(body.username || '').trim().toLowerCase().slice(0, 40);
+    const found = findUser(name);
+    // One check at a time per address, and only a few at once over all addresses. A wrong
+    // guess is counted as soon as its check ends, before the next one from there can start.
+    const passOk = await checkGuarded(fkey, body.password, found || DUMMY_RECORD);
+    if (!passOk || !found || found.disabled) {
+      noteFail(fkey, name);
+      audit(req, 'login.fail', { username: name });
+      await sleep(500);
+      throw httpError(401, 'Wrong username or password');
     }
-    signingIn.add(ip);
-    try {
-      locked();
-      const name = String(body.username || '').trim().toLowerCase().slice(0, 40);
-      const found = findUser(name);
-      const passOk = typeof body.password === 'string' && body.password.length <= 200 &&
-        await checkPassword(body.password, found || DUMMY_RECORD);
-      if (!passOk || !found || found.disabled) {
-        noteFail(ip);
-        audit(req, 'login.fail', { username: name });
-        await sleep(500);
-        throw httpError(401, 'Wrong username or password');
-      }
-      fails.delete(ip);
-      const now = Date.now();
-      const token = crypto.randomBytes(32).toString('hex');
-      sessions.set(sha(token), {
-        username: found.username, expires: now + SESSION_MS, pw: pwTag(found), active: now, idle: false,
-        secure: !!req.socket.encrypted
-      });
-      saveSessions();
-      res.setHeader('Set-Cookie', sessionCookie(req, token, SESSION_MS / 1000));
-      found.lastLogin = new Date().toISOString();
-      saveUsers();
-      req.user = found;
-      audit(req, 'login.ok');
-      return sendJson(res, 200, { ok: true });
-    } finally {
-      signingIn.delete(ip);
-    }
+    clearFails(fkey, found.username);
+    const now = Date.now();
+    const token = crypto.randomBytes(32).toString('hex');
+    sessions.set(sha(token), {
+      username: found.username, expires: now + SESSION_MS, pw: pwTag(found), active: now, idle: false,
+      secure: !!req.socket.encrypted
+    });
+    saveSessions();
+    res.setHeader('Set-Cookie', sessionCookie(req, token, SESSION_MS / 1000));
+    found.lastLogin = new Date().toISOString();
+    saveUsers();
+    req.user = found;
+    audit(req, 'login.ok');
+    return sendJson(res, 200, { ok: true });
   }
 
   const user = sessionUser(req);
@@ -1058,6 +1135,16 @@ async function handle(req, res) {
     throw e;
   }
   req.user = user;
+  // Permissions are checked when a request starts, but its body can arrive much later. A
+  // change is applied only if the account still has the same access once the body is in:
+  // not signed out, disabled, deleted, demoted or moved to other screens in the meantime.
+  const access = accessTag(user);
+  const stillAllowed = function () { return sessionUser(req) === user && accessTag(user) === access; };
+  const readBody = async function () {
+    const body = await readJson(req);
+    if (!stillAllowed()) throw httpError(401, 'Your access changed while this was being sent. Sign in again.');
+    return body;
+  };
   // Only real use keeps a session alive: any change, or a refresh sent after the person
   // touched the page. The page's background refreshes do not carry the header.
   if (!reading || req.headers['x-tvboard-active'] === '1') req.session.active = Date.now();
@@ -1076,8 +1163,15 @@ async function handle(req, res) {
     return sendJson(res, 200, { ok: true });
   }
   if (method === 'POST' && seg[1] === 'password') {
-    const body = await readJson(req);
-    if (typeof body.current !== 'string' || body.current.length > 200 || !(await checkPassword(body.current, user))) {
+    // The current password is guarded like a sign-in: same lockout, same slots. Otherwise a
+    // signed-in screen left unattended would allow unlimited guesses at its password.
+    const fkey = failKey(ip);
+    const wait = lockedFor(fkey);
+    if (wait) throw httpError(429, 'Too many wrong attempts. Try again in ' + Math.ceil(wait / 60000) + ' minutes.');
+    const body = await readBody();
+    if (!(await checkGuarded(fkey, body.current, user))) {
+      noteFail(fkey, user.username);
+      audit(req, 'password.fail');
       await sleep(500);
       throw httpError(400, 'Your current password is not right');
     }
@@ -1106,7 +1200,7 @@ async function handle(req, res) {
     if (!isAdmin) throw httpError(403, 'Only an admin can manage users');
     if (method === 'GET' && seg.length === 2) return sendJson(res, 200, userList());
     if (method === 'POST' && seg.length === 2) {
-      const body = await readJson(req);
+      const body = await readBody();
       const name = String(body.username || '').trim().toLowerCase();
       if (!USERNAME_RE.test(name)) throw httpError(400, 'Usernames are 2 to 32 characters: letters, numbers, dot, dash or underscore');
       if (findUser(name)) throw httpError(400, 'That username is already taken');
@@ -1123,7 +1217,7 @@ async function handle(req, res) {
     if (!target) throw httpError(404, 'Unknown user');
     const self = target === user;
     if (method === 'PUT') {
-      const body = await readJson(req);
+      const body = await readBody();
       const changes = [];
       if (body.role !== undefined && body.role !== target.role) {
         if (!ROLES[body.role]) throw httpError(400, 'Unknown permission level');
@@ -1163,7 +1257,7 @@ async function handle(req, res) {
   }
   if (seg[1] === 'settings' && method === 'PUT') {
     if (!isAdmin) throw httpError(403, 'Only an admin can change this');
-    const body = await readJson(req);
+    const body = await readBody();
     if (body.pairing !== undefined && !!body.pairing !== !!state.pairing) {
       state.pairing = !!body.pairing;
       adopt = null;
@@ -1172,11 +1266,21 @@ async function handle(req, res) {
         // next time it asks, but only at the address it has been asking from, and only
         // for a couple of minutes. Every other TV has to be paired with a code.
         const now = Date.now();
+        // A TV plays one screen from one address. So a screen is handed over only when exactly
+        // one address has been playing it and that address played no other screen. A device
+        // that asks for many screens gets no keys; a TV caught up in that is paired by code.
         const ips = {};
+        const recent = {};
+        const count = {};
         state.screens.forEach(function (s) {
           if (!s.key) s.key = newKey();
           const from = seenFrom[s.id] || {};
-          ips[s.id] = Object.keys(from).filter(function (a) { return now - from[a] < ONLINE_WINDOW_MS; });
+          recent[s.id] = Object.keys(from).filter(function (a) { return now - from[a] < ONLINE_WINDOW_MS; });
+          recent[s.id].forEach(function (a) { count[a] = (count[a] || 0) + 1; });
+        });
+        state.screens.forEach(function (s) {
+          const r = recent[s.id];
+          if (r.length === 1 && count[r[0]] === 1) ips[s.id] = r;
         });
         adopt = { until: now + ADOPT_MS, ips: ips };
       }
@@ -1193,7 +1297,7 @@ async function handle(req, res) {
   if (seg[1] === 'screens') {
     if (method === 'POST' && seg.length === 2) {
       if (!isAdmin) throw httpError(403, 'Only an admin can add screens');
-      const body = await readJson(req);
+      const body = await readBody();
       let n = 1;
       while (findScreen(String(n))) n++;
       if (state.screens.length >= 100) throw httpError(400, 'Too many screens');
@@ -1210,7 +1314,7 @@ async function handle(req, res) {
     if (!s) throw httpError(404, 'Unknown screen');
     if (!canScreen(user, s.id)) throw httpError(403, 'Your account cannot change that screen');
     if (method === 'PUT' && seg.length === 3) {
-      const body = await readJson(req);
+      const body = await readBody();
       const items = body.items === undefined ? null : cleanItems(body.items);
       const name = isAdmin ? cleanName(body.name, s.name) : s.name; // only admins rename screens
       const renamed = name !== s.name;
@@ -1230,6 +1334,7 @@ async function handle(req, res) {
       delete seenFrom[s.id];
       delete playing[s.id];
       delete identify[s.id];
+      if (adopt) delete adopt.ips[s.id];
       users.forEach(function (u) { if (u.screens) u.screens = u.screens.filter(function (id) { return id !== s.id; }); });
       saveUsers();
       saveState();
@@ -1242,7 +1347,7 @@ async function handle(req, res) {
     }
     if (method === 'POST' && seg[3] === 'pair') { // put this screen on the TV that is showing this code
       if (!state.pairing) throw httpError(400, 'TV pairing is switched off');
-      const body = await readJson(req);
+      const body = await readBody();
       const code = String(body.code == null ? '' : body.code).replace(/\D/g, '');
       const now = Date.now();
       let tv = null;
@@ -1267,7 +1372,7 @@ async function handle(req, res) {
       return sendJson(res, 200, { ok: true });
     }
   }
-  if (seg[1] === 'upload' && method === 'POST') return upload(req, res, url);
+  if (seg[1] === 'upload' && method === 'POST') return upload(req, res, url, stillAllowed);
 
   // Deleting a file removes it from every playlist, so only its uploader or an admin may do it.
   const owners = state.owners || {};
