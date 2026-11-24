@@ -119,6 +119,15 @@ $env:IDLE_MINUTES = "30"; node server.js
 - TVs do not hold videos. A video may keep playing from the browser's own copy, but that is not guaranteed.
 - Changes reach the TVs only while the server is running.
 
+## Licence
+
+Screen Cast is available under either of these licences, whichever you choose:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+Unless you say otherwise, anything you contribute is offered under both licences in the same way.
+
 ## Fonts
 
 The control page uses [Unbounded](https://github.com/googlefonts/unbounded) (Copyright 2022 The Unbounded Project Authors) and [Jost](https://github.com/indestructible-type/Jost) (Copyright 2020 The Jost Project Authors). Both are embedded in `server.js` under the [SIL Open Font License 1.1](https://openfontlicense.org).

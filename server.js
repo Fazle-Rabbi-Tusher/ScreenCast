@@ -1909,7 +1909,7 @@ body.readonly .tile,body.readonly #editor input,body.readonly #editor select{poi
     <div class="phead"><h2>Add a user</h2></div>
     <div class="row">
       <input id="nuName" placeholder="Username" maxlength="32" autocomplete="off" aria-label="Username">
-      <input id="nuPass" placeholder="Temporary password" maxlength="200" autocomplete="off" aria-label="Temporary password">
+      <input id="nuPass" type="password" placeholder="Temporary password" maxlength="200" autocomplete="new-password" aria-label="Temporary password">
       <select id="nuRole" aria-label="Level"><option value="editor">Editor</option><option value="viewer">Viewer</option><option value="admin">Admin</option></select>
       <button id="nuAdd" class="primary">Add user</button>
     </div>
@@ -2027,7 +2027,7 @@ body.readonly .tile,body.readonly #editor input,body.readonly #editor select{poi
   function ask(o) {
     return new Promise(function (resolve) {
       var back, last = document.activeElement;
-      var field = o.input ? h('input', { type: 'text', maxlength: 200, autocomplete: 'off', placeholder: o.input, 'aria-label': o.input }) : null;
+      var field = o.input ? h('input', { type: o.secret ? 'password' : 'text', maxlength: 200, autocomplete: o.secret ? 'new-password' : 'off', placeholder: o.input, 'aria-label': o.input }) : null;
       function done(v) {
         document.removeEventListener('keydown', key, true);
         document.body.removeChild(back);
@@ -2629,7 +2629,7 @@ body.readonly .tile,body.readonly #editor input,body.readonly #editor select{poi
         h('button', { class: 'small', text: 'Reset password', onclick: function () {
           ask({
             text: 'Temporary password for ' + u.username + ' (at least ' + (S.minPassword || 12) + ' characters). They must change it when they sign in.',
-            input: 'Temporary password', ok: 'Reset password'
+            input: 'Temporary password', secret: true, ok: 'Reset password'
           }).then(function (p) {
             if (p) saveUser(u.username, { password: p }, 'Password reset for ' + u.username + '. They are signed out everywhere.');
           });
